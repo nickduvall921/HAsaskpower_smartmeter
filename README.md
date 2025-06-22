@@ -12,8 +12,7 @@ Fetches 15-minute interval smart meter data.
 Provides summary sensors for the most recent full day, the last 7 days, and the previous calendar month's usage.
 Provides sensors for the total charges and kWh usage from your last bill.
 Includes two TOTAL_INCREASING sensors for seamless integration with the Home Assistant Energy Dashboard.
-Backfills up to 60 days of historical data into Home Assistant's statistics database.
-All sensors are grouped under a single device for your SaskPower account.
+Backfills up to 365 days of historical data into Home Assistant's statistics database on first run.
 
 # Installation
 
