@@ -1,0 +1,6 @@
+{
+  "name": "SaskPower SmartMeter",
+  "content_in_root": false,
+  "country": "CA",
+  "domains": ["sensor"]
+}
