@@ -10,7 +10,6 @@ from __future__ import annotations
 import base64
 import csv
 import io
-import json
 import logging
 import re
 import zipfile
@@ -23,12 +22,66 @@ import requests
 
 _LOGGER = logging.getLogger(__name__)
 
+# --- URL Constants ---
+# Centralised here so that if SaskPower ever changes their URL structure,
+# there is a single place to update rather than hunting through login logic.
+_BASE_URL = "https://www.saskpower.com"
+_B2C_TENANT_HOST = "saskpowerb2c.b2clogin.com"
+_B2C_ONMICROSOFT = "saskpowerb2c.onmicrosoft.com"
+_LOGIN_PATH = "/identity/externallogin"
+_CALLBACK_PATH = "/identity/externallogincallback"
+_DASHBOARD_PATH = "/profile/my-dashboard"
+_DOWNLOAD_PAGE_PATH = "/Profile/My-Dashboard/My-Reports/Download-Data"
+_DOWNLOAD_API_PATH = "/api/sitecore/Analytics/DownloadData"
+
+# Regina does not observe Daylight Saving Time, so this offset is fixed year-round.
+_SASK_TZ = ZoneInfo("America/Regina")
+
+
+def _parse_form_inputs(html: str) -> dict[str, str]:
+    """
+    Robustly parse all <input> tag name/value pairs from an HTML string.
+
+    Standard regex approaches break when HTML attribute order varies (which is
+    valid). This function parses each input tag independently so attribute
+    order doesn't matter.
+    """
+    inputs: dict[str, str] = {}
+    for input_tag in re.finditer(r"<input([^>]*)>", html, re.IGNORECASE):
+        attrs = input_tag.group(1)
+        name_match = re.search(r'name=["\']([^"\']+)["\']', attrs)
+        value_match = re.search(r'value=["\']([^"\']*)["\']', attrs)
+        if name_match:
+            inputs[name_match.group(1)] = value_match.group(1) if value_match else ""
+    return inputs
+
+
+def _get_verification_token(html: str) -> str | None:
+    """
+    Extract __RequestVerificationToken from an HTML page.
+
+    Uses a per-tag approach so the attribute order (name vs value vs type)
+    doesn't matter.
+    """
+    for input_tag in re.finditer(r"<input([^>]*)>", html, re.IGNORECASE):
+        attrs = input_tag.group(1)
+        name_match = re.search(r'name=["\']([^"\']+)["\']', attrs)
+        if name_match and name_match.group(1) == "__RequestVerificationToken":
+            value_match = re.search(r'value=["\']([^"\']+)["\']', attrs)
+            if value_match:
+                return value_match.group(1)
+    return None
+
 
 class SaskPowerScraper:
     """Orchestrates the scraping of data from the SaskPower website."""
 
     def __init__(
-        self, username: str, password: str, account_number: str, session: requests.Session | None = None
+        self,
+        username: str,
+        password: str,
+        account_number: str,
+        session: requests.Session | None = None,
     ) -> None:
         """
         Initialize the scraper.
@@ -37,7 +90,7 @@ class SaskPowerScraper:
             username: The username for SaskPower online access.
             password: The password for SaskPower online access.
             account_number: The SaskPower account number.
-            session: An optional requests.Session object.
+            session: An optional requests.Session object (useful for testing).
         """
         if not all([username, password, account_number]):
             raise ValueError("Username, password, and account number cannot be empty.")
@@ -58,29 +111,51 @@ class SaskPowerScraper:
 
     def login(self) -> bool:
         """
-        Perform the complete, multi-step authentication flow.
+        Perform the complete, multi-step Azure B2C authentication flow.
 
         Returns:
             True if login is successful, False otherwise.
         """
+        # Clear any stale cookies from a previous session so they don't
+        # interfere with a fresh login attempt.
+        self._session.cookies.clear()
+
         try:
             _LOGGER.info("Attempting to log in to SaskPower...")
 
-            # 1. Initial POST to get the B2C redirect URL.
+            # --- Step 1: POST to SaskPower to trigger the B2C redirect ---
             _LOGGER.debug("Step 1: Initiating login to get Azure B2C redirect.")
-            initial_url = "https://www.saskpower.com/identity/externallogin?authenticationType=SaskPower.Azure.B2C&ReturnUrl=%2fidentity%2fexternallogincallback%3fReturnUrl%3dhttp%253a%252f%252fwww.saskpower.com%252fprofile%252fmy-dashboard%26sc_site%3dSaskPower%26authenticationSource%3dDefault&sc_site=SaskPower"
+            return_url = (
+                f"{_BASE_URL}{_CALLBACK_PATH}"
+                f"?ReturnUrl=http%3a%2f%2f{_BASE_URL.replace('https://', '')}{_DASHBOARD_PATH}"
+                f"&sc_site=SaskPower&authenticationSource=Default"
+            )
+            initial_url = (
+                f"{_BASE_URL}{_LOGIN_PATH}"
+                f"?authenticationType=SaskPower.Azure.B2C"
+                f"&ReturnUrl={requests.utils.quote(return_url, safe='')}"
+                f"&sc_site=SaskPower"
+            )
             response = self._session.post(initial_url, allow_redirects=True, timeout=30)
             response.raise_for_status()
 
-            if "saskpowerb2c.b2clogin.com" not in response.url:
-                _LOGGER.error("Failed to redirect to B2C login page. Current URL: %s", response.url)
+            if _B2C_TENANT_HOST not in response.url:
+                _LOGGER.error(
+                    "Step 1 failed: did not redirect to B2C login page. "
+                    "The SaskPower login URL structure may have changed. "
+                    "Current URL: %s",
+                    response.url,
+                )
                 return False
 
-            # 2. Extract dynamic tokens from the B2C login page's JavaScript.
-            _LOGGER.debug("Step 2: On B2C login page, extracting CSRF and Transaction ID.")
+            # --- Step 2: Extract dynamic tokens from the B2C page's JavaScript ---
+            _LOGGER.debug("Step 2: Extracting CSRF token and Transaction ID from B2C page.")
             settings_match = re.search(r"var SETTINGS = ({.*?});", response.text, re.DOTALL)
             if not settings_match:
-                _LOGGER.error("Could not find 'SETTINGS' JavaScript block in login page HTML.")
+                _LOGGER.error(
+                    "Step 2 failed: could not find 'SETTINGS' JavaScript block. "
+                    "The B2C login page structure may have changed."
+                )
                 return False
 
             settings_str = settings_match.group(1)
@@ -88,87 +163,150 @@ class SaskPowerScraper:
             transid_match = re.search(r'"transId":\s*"([^"]+)"', settings_str)
 
             if not csrf_match or not transid_match:
-                _LOGGER.error("Could not parse CSRF token or Transaction ID from SETTINGS.")
+                _LOGGER.error(
+                    "Step 2 failed: could not parse CSRF token or Transaction ID from SETTINGS block."
+                )
                 return False
 
             csrf_token = csrf_match.group(1)
             trans_id = transid_match.group(1)
-            policy = parse_qs(urlparse(response.url).query).get("p", [""])[0]
 
-            # 3. Submit credentials via an XHR POST request.
+            # Extract the B2C policy name from the URL query string.
+            # This is critical — if it can't be found we must fail loudly rather
+            # than silently falling back to a hardcoded value that may be wrong.
+            policy = parse_qs(urlparse(response.url).query).get("p", [None])[0]
+            if not policy:
+                _LOGGER.error(
+                    "Step 2 failed: could not extract B2C policy name from URL '%s'. "
+                    "The login URL structure may have changed.",
+                    response.url,
+                )
+                return False
+
+            _LOGGER.debug("Extracted B2C policy: %s", policy)
+
+            # --- Step 3: Submit credentials via XHR POST ---
             _LOGGER.debug("Step 3: Submitting credentials to B2C SelfAsserted endpoint.")
-            self_asserted_url = f"https://saskpowerb2c.b2clogin.com/saskpowerb2c.onmicrosoft.com/{policy}/SelfAsserted?tx={trans_id}&p={policy}"
-            login_payload = {"request_type": "RESPONSE", "signInName": self._username, "password": self._password}
+            self_asserted_url = (
+                f"https://{_B2C_TENANT_HOST}/{_B2C_ONMICROSOFT}/{policy}"
+                f"/SelfAsserted?tx={trans_id}&p={policy}"
+            )
+            login_payload = {
+                "request_type": "RESPONSE",
+                "signInName": self._username,
+                "password": self._password,
+            }
             xhr_headers = {
                 "X-CSRF-TOKEN": csrf_token,
                 "X-Requested-With": "XMLHttpRequest",
                 "Accept": "application/json, text/javascript, */*; q=0.01",
                 "Referer": response.url,
-                "Origin": "https://saskpowerb2c.b2clogin.com",
+                "Origin": f"https://{_B2C_TENANT_HOST}",
             }
-            auth_response = self._session.post(self_asserted_url, headers=xhr_headers, data=login_payload, timeout=30)
+            auth_response = self._session.post(
+                self_asserted_url, headers=xhr_headers, data=login_payload, timeout=30
+            )
             auth_response.raise_for_status()
 
             auth_json = auth_response.json()
             if auth_json.get("status") != "200":
-                _LOGGER.error("B2C authentication failed: %s", auth_json.get("message", "Unknown error"))
+                _LOGGER.error(
+                    "Step 3 failed: B2C credential submission rejected: %s",
+                    auth_json.get("message", "Unknown error"),
+                )
                 return False
 
-            # 4. Follow the confirmation step.
-            _LOGGER.debug("Step 4: Making GET request to B2C 'confirmed' endpoint.")
-            confirmed_url = f"https://saskpowerb2c.b2clogin.com/saskpowerb2c.onmicrosoft.com/{policy}/api/CombinedSigninAndSignup/confirmed?rememberMe=false&csrf_token={csrf_token}&tx={trans_id}&p={policy}"
+            # --- Step 4: GET the B2C 'confirmed' endpoint ---
+            _LOGGER.debug("Step 4: Following B2C confirmation redirect.")
+            confirmed_url = (
+                f"https://{_B2C_TENANT_HOST}/{_B2C_ONMICROSOFT}/{policy}"
+                f"/api/CombinedSigninAndSignup/confirmed"
+                f"?rememberMe=false&csrf_token={csrf_token}&tx={trans_id}&p={policy}"
+            )
             confirmed_response = self._session.get(confirmed_url, timeout=30)
             confirmed_response.raise_for_status()
 
-            # 5. The 'confirmed' response contains an HTML form. Submit it to finalize login.
+            # --- Step 5: Parse and submit the final token-exchange form ---
             _LOGGER.debug("Step 5: Submitting final token exchange form back to SaskPower.")
-            form_action_match = re.search(r"<form[^>]+action=['\"]([^'\"]+)['\"]", confirmed_response.text)
+            form_action_match = re.search(
+                r"<form[^>]+action=['\"]([^'\"]+)['\"]", confirmed_response.text
+            )
             if not form_action_match:
-                _LOGGER.error("Could not find form action in the final confirmation page.")
+                _LOGGER.error(
+                    "Step 5 failed: could not find form action in B2C confirmation page. "
+                    "The B2C flow may have changed."
+                )
                 return False
 
             form_action = form_action_match.group(1).replace("&amp;", "&")
-            inputs = re.findall(r"<input[^>]+name=['\"]([^'\"]+)['\"][^>]+value=['\"]([^'\"]*)['\"]", confirmed_response.text)
-            form_data = {name: value for name, value in inputs}
 
-            if "id_token" not in form_data:
-                _LOGGER.error("Could not find 'id_token' in the final form post. Login failed.")
+            # Use the robust per-tag parser so attribute order doesn't matter.
+            form_data = _parse_form_inputs(confirmed_response.text)
+
+            if not form_data.get("id_token"):
+                _LOGGER.error(
+                    "Step 5 failed: 'id_token' not found in the final form. "
+                    "Available fields: %s",
+                    list(form_data.keys()),
+                )
                 return False
 
-            final_response = self._session.post(form_action, data=form_data, allow_redirects=True, timeout=30)
+            final_response = self._session.post(
+                form_action, data=form_data, allow_redirects=True, timeout=30
+            )
             final_response.raise_for_status()
 
-            if "my-dashboard" in final_response.url:
+            # Verify we landed somewhere sensible on the SaskPower domain.
+            if _DASHBOARD_PATH in final_response.url:
                 _LOGGER.info("Login successful!")
                 return True
-            
-            _LOGGER.warning("Login process may have succeeded, but did not land on dashboard. Final URL: %s", final_response.url)
-            return ".saskpower.com" in self._session.cookies.list_domains()
+
+            # Fallback: if cookies are present we're probably logged in even if
+            # the redirect landed on an unexpected page (e.g. a maintenance banner).
+            if any(_BASE_URL.replace("https://", "") in d for d in self._session.cookies.list_domains()):
+                _LOGGER.warning(
+                    "Login appears successful but did not land on dashboard. "
+                    "Final URL: %s",
+                    final_response.url,
+                )
+                return True
+
+            _LOGGER.error(
+                "Login failed: unexpected final URL '%s' and no SaskPower session cookies found.",
+                final_response.url,
+            )
+            return False
 
         except requests.exceptions.RequestException as e:
-            _LOGGER.error("A network error occurred during the login process: %s", e)
+            _LOGGER.error("Network error during login: %s", e)
             return False
         except Exception:
-            _LOGGER.exception("An unexpected error occurred during login")
+            _LOGGER.exception("Unexpected error during login")
             return False
 
     def _fetch_data_from_api(
-        self, verification_token: str, data_category: str, start_date: date, end_date: date
+        self,
+        verification_token: str,
+        data_category: str,
+        start_date: date,
+        end_date: date,
     ) -> list[dict] | None:
         """
-        Generic function to fetch a data report for a given category and date range.
+        Fetch a data report for a given category and date range.
 
         Args:
             verification_token: The __RequestVerificationToken from the download page.
-            data_category: The category of data to download ('PD' or 'BB').
+            data_category: 'PD' for power usage or 'BB' for billing breakdown.
             start_date: The start date for the report.
             end_date: The end date for the report.
 
         Returns:
-            A list of dictionaries representing the rows of the CSV, or None on failure.
+            A list of row dicts from the CSV, or None on failure.
         """
-        _LOGGER.debug("Requesting data for category '%s' from %s to %s", data_category, start_date, end_date)
-        api_url = "https://www.saskpower.com/api/sitecore/Analytics/DownloadData"
+        _LOGGER.debug(
+            "Requesting '%s' data from %s to %s", data_category, start_date, end_date
+        )
+        api_url = f"{_BASE_URL}{_DOWNLOAD_API_PATH}"
         payload = {
             "accountNumbers[]": self._account_number,
             "collectiveAccountNumbers[]": "",
@@ -184,12 +322,14 @@ class SaskPowerScraper:
         }
         api_headers = {
             "Accept": "*/*",
-            "Origin": "https://www.saskpower.com",
-            "Referer": "https://www.saskpower.com/Profile/My-Dashboard/My-Reports/Download-Data",
+            "Origin": _BASE_URL,
+            "Referer": f"{_BASE_URL}{_DOWNLOAD_PAGE_PATH}",
             "X-Requested-With": "XMLHttpRequest",
         }
 
-        api_response = self._session.post(api_url, headers=api_headers, data=payload, timeout=60)
+        api_response = self._session.post(
+            api_url, headers=api_headers, data=payload, timeout=60
+        )
         api_response.raise_for_status()
 
         content_type = api_response.headers.get("Content-Type", "")
@@ -202,12 +342,14 @@ class SaskPowerScraper:
         elif "application/zip" in content_type:
             zip_bytes = api_response.content
         else:
-            _LOGGER.error("Expected ZIP or JSON for '%s', but got %s", data_category, content_type)
+            _LOGGER.error(
+                "Unexpected content type for '%s': %s", data_category, content_type
+            )
             return None
 
         if not zip_bytes:
-             _LOGGER.warning("API returned empty file data for category '%s'.", data_category)
-             return None
+            _LOGGER.warning("API returned empty file data for '%s'.", data_category)
+            return None
 
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             csv_filename = next((f for f in zf.namelist() if f.endswith(".csv")), None)
@@ -218,68 +360,123 @@ class SaskPowerScraper:
                 csv_text = io.TextIOWrapper(csv_file, "utf-8-sig")
                 return list(csv.DictReader(csv_text))
 
-    def get_data(self, fetch_days: int = 60) -> dict | None:
+    @staticmethod
+    def _parse_saskpower_datetime(raw: str) -> datetime:
         """
-        Fetch and process both power usage and billing data after logging in.
+        Parse a SaskPower datetime string in a locale-independent way.
+
+        SaskPower uses the format '2024-Jan-15 02:00 PM'. The %b directive is
+        locale-dependent on some systems, so we normalise the month abbreviation
+        to uppercase English before parsing.
 
         Args:
-            fetch_days: Number of days of historical data to fetch (default: 60)
+            raw: The raw datetime string from the CSV.
 
         Returns:
-            A dictionary containing all processed data, or None on failure.
+            A naive datetime object (caller should attach timezone).
+
+        Raises:
+            ValueError: If the string cannot be parsed.
         """
-        _LOGGER.info("Starting data retrieval for SaskPower account %s (fetching %d days).", 
-                     self._account_number, fetch_days)
+        # Normalise to uppercase so strptime's English %b works regardless of locale.
+        return datetime.strptime(raw.strip().upper(), "%Y-%b-%d %I:%M %p")
+
+    def get_data(self, fetch_days: int = 60) -> dict | None:
+        """
+        Fetch and process both power usage and billing data.
+
+        Args:
+            fetch_days: Number of days of historical data to fetch.
+
+        Returns:
+            A dictionary of processed data, or None on complete failure.
+            Partial data (e.g. usage without billing) is returned with a warning.
+        """
+        _LOGGER.info(
+            "Starting data retrieval for account %s (%d days).",
+            self._account_number,
+            fetch_days,
+        )
         if not self.login():
-            _LOGGER.error("Cannot retrieve data because login failed.")
+            _LOGGER.error("Data retrieval aborted: login failed.")
             return None
 
         try:
-            # Get the verification token needed for API calls
-            _LOGGER.debug("Navigating to download page to get verification token.")
-            download_page_url = "https://www.saskpower.com/Profile/My-Dashboard/My-Reports/Download-Data"
+            # --- Obtain the request verification token ---
+            _LOGGER.debug("Fetching verification token from download page.")
+            download_page_url = f"{_BASE_URL}{_DOWNLOAD_PAGE_PATH}"
             response = self._session.get(download_page_url, timeout=30)
             response.raise_for_status()
-            token_match = re.search(r"name=['\"]__RequestVerificationToken['\"]\s+type=['\"]hidden['\"]\s+value=['\"]([^'\"]+)['\"]", response.text)
-            if not token_match:
-                _LOGGER.error("Could not find __RequestVerificationToken on the download page.")
-                return None
-            verification_token = token_match.group(1)
 
-            # Calculate date range based on fetch_days parameter
+            verification_token = _get_verification_token(response.text)
+            if not verification_token:
+                _LOGGER.error(
+                    "Could not find __RequestVerificationToken on the download page. "
+                    "The page structure may have changed."
+                )
+                return None
+
             end_date = date.today()
             start_date = end_date - timedelta(days=fetch_days)
 
-            # --- 1. Fetch and Process Power Usage Data (PD) ---
-            usage_data = self._fetch_data_from_api(verification_token, "PD", start_date, end_date)
-            usage_stats = {}
-            interval_readings = []
+            # --- 1. Power Usage Data (PD) ---
+            usage_data = self._fetch_data_from_api(
+                verification_token, "PD", start_date, end_date
+            )
+            usage_stats: dict = {}
+            interval_readings: list[dict] = []
+
             if usage_data:
-                sask_tz = ZoneInfo("America/Regina")
-                data_by_day = defaultdict(list)
-                latest_reading_dt = None
+                data_by_day: dict = defaultdict(list)
+                latest_reading_dt: datetime | None = None
 
                 for row in usage_data:
                     try:
                         usage = float(row["Consumption"])
-                        aware_dt = datetime.strptime(row["DateTime"].strip(), "%Y-%b-%d %I:%M %p").replace(tzinfo=sask_tz)
+                        # Use locale-safe parser (fix #6)
+                        naive_dt = self._parse_saskpower_datetime(row["DateTime"])
+                        aware_dt = naive_dt.replace(tzinfo=_SASK_TZ)
                         interval_readings.append({"datetime": aware_dt, "usage": usage})
                         data_by_day[aware_dt.date()].append(usage)
                         if latest_reading_dt is None or aware_dt > latest_reading_dt:
                             latest_reading_dt = aware_dt
-                    except (ValueError, TypeError, KeyError):
-                        _LOGGER.debug("Skipping invalid usage data row: %s", row)
+                    except (ValueError, TypeError, KeyError) as exc:
+                        _LOGGER.debug("Skipping invalid usage row: %s — %s", row, exc)
                         continue
-                
-                interval_readings.sort(key=lambda x: x["datetime"])
-                most_recent_full_day = next((d for d in sorted(data_by_day.keys(), reverse=True) if len(data_by_day[d]) >= 96), None)
-                daily_usage = sum(data_by_day.get(most_recent_full_day, []))
-                weekly_usage = sum(sum(data_by_day.get(most_recent_full_day - timedelta(days=i), [])) for i in range(7)) if most_recent_full_day else 0
 
-                today = datetime.now(sask_tz).date()
+                interval_readings.sort(key=lambda x: x["datetime"])
+
+                # A "full day" has 96 x 15-minute readings.
+                most_recent_full_day = next(
+                    (
+                        d
+                        for d in sorted(data_by_day.keys(), reverse=True)
+                        if len(data_by_day[d]) >= 96
+                    ),
+                    None,
+                )
+
+                daily_usage = (
+                    sum(data_by_day[most_recent_full_day]) if most_recent_full_day else 0
+                )
+                weekly_usage = (
+                    sum(
+                        sum(data_by_day.get(most_recent_full_day - timedelta(days=i), []))
+                        for i in range(7)
+                    )
+                    if most_recent_full_day
+                    else 0
+                )
+
+                today = datetime.now(_SASK_TZ).date()
                 last_day_prev_month = today.replace(day=1) - timedelta(days=1)
-                monthly_usage = sum(sum(usages) for day, usages in data_by_day.items() if last_day_prev_month.replace(day=1) <= day <= last_day_prev_month)
-                
+                first_day_prev_month = last_day_prev_month.replace(day=1)
+                monthly_usage = sum(
+                    sum(usages)
+                    for day, usages in data_by_day.items()
+                    if first_day_prev_month <= day <= last_day_prev_month
+                )
+
                 usage_stats = {
                     "daily_usage": round(daily_usage, 3),
                     "weekly_usage": round(weekly_usage, 3),
@@ -287,43 +484,94 @@ class SaskPowerScraper:
                     "latest_data_timestamp": latest_reading_dt,
                     "interval_readings": interval_readings,
                 }
-                _LOGGER.info("Successfully processed %d interval readings (requested %d days).", 
-                           len(interval_readings), fetch_days)
+                _LOGGER.info(
+                    "Processed %d interval readings.", len(interval_readings)
+                )
+            else:
+                _LOGGER.warning(
+                    "No power usage data retrieved for account %s. "
+                    "Billing data may still be available.",
+                    self._account_number,
+                )
 
-            # --- 2. Fetch and Process Billing Data (BB) ---
-            # Always fetch full billing history (billing data is much smaller)
-            billing_data = self._fetch_data_from_api(verification_token, "BB", date(2000, 1, 1), date.today())
-            billing_stats = {}
+            # --- 2. Billing Data (BB) ---
+            # Billing files are small so always fetch the full history.
+            billing_data = self._fetch_data_from_api(
+                verification_token, "BB", date(2000, 1, 1), date.today()
+            )
+            billing_stats: dict = {}
+
             if billing_data:
                 try:
-                    bill_date_key, charges_key, usage_key = "BillIssueDate", "TotalCharges", "ConsumptionKwh"
+                    bill_date_key = "BillIssueDate"
+                    charges_key = "TotalCharges"
+                    usage_key = "ConsumptionKwh"
+
                     if bill_date_key not in billing_data[0]:
-                        _LOGGER.warning("Billing data is missing the '%s' column.", bill_date_key)
+                        _LOGGER.warning(
+                            "Billing data missing '%s' column. Found: %s",
+                            bill_date_key,
+                            list(billing_data[0].keys()),
+                        )
                     else:
-                        latest_bill = max(billing_data, key=lambda row: datetime.strptime(row[bill_date_key].strip(), "%d-%b-%Y"))
-                        last_bill_charges = float(latest_bill.get(charges_key, "0").replace("$", "").replace(",", ""))
+                        latest_bill = max(
+                            billing_data,
+                            key=lambda row: datetime.strptime(
+                                row[bill_date_key].strip(), "%d-%b-%Y"
+                            ),
+                        )
+                        last_bill_charges = float(
+                            latest_bill.get(charges_key, "0")
+                            .replace("$", "")
+                            .replace(",", "")
+                        )
                         last_bill_usage = float(latest_bill.get(usage_key, 0))
-                        avg_cost = last_bill_charges / last_bill_usage if last_bill_usage > 0 else 0
+                        avg_cost = (
+                            last_bill_charges / last_bill_usage
+                            if last_bill_usage > 0
+                            else 0
+                        )
                         billing_stats = {
                             "last_bill_total_charges": last_bill_charges,
                             "last_bill_total_usage": last_bill_usage,
                             "avg_cost_per_kwh": avg_cost,
                         }
-                        _LOGGER.info("Successfully processed latest bill from %s.", latest_bill[bill_date_key])
-                except (ValueError, TypeError, KeyError) as e:
-                     _LOGGER.error("Could not process billing data: %s. Headers found: %s", e, billing_data[0].keys() if billing_data else "N/A")
+                        _LOGGER.info(
+                            "Processed latest bill from %s.", latest_bill[bill_date_key]
+                        )
+                except (ValueError, TypeError, KeyError) as exc:
+                    _LOGGER.error(
+                        "Could not process billing data: %s. Headers: %s",
+                        exc,
+                        list(billing_data[0].keys()) if billing_data else "N/A",
+                    )
+            else:
+                _LOGGER.warning(
+                    "No billing data retrieved for account %s. "
+                    "Usage data may still be available.",
+                    self._account_number,
+                )
 
-            # --- 3. Combine and Return Results ---
+            # --- 3. Combine results ---
             combined_data = {**usage_stats, **billing_stats}
             if not combined_data:
-                _LOGGER.warning("No data could be retrieved for account %s.", self._account_number)
+                _LOGGER.error(
+                    "Both usage and billing data failed for account %s.",
+                    self._account_number,
+                )
                 return None
-            
+
+            # Warn clearly if only one half succeeded so logs make it obvious.
+            if not usage_stats:
+                _LOGGER.warning("Returning partial data: billing only (no usage data).")
+            if not billing_stats:
+                _LOGGER.warning("Returning partial data: usage only (no billing data).")
+
             return combined_data
 
-        except requests.exceptions.RequestException as e:
-            _LOGGER.error("A network error occurred during data retrieval: %s", e)
+        except requests.exceptions.RequestException as exc:
+            _LOGGER.error("Network error during data retrieval: %s", exc)
             return None
         except Exception:
-            _LOGGER.exception("An unexpected error occurred during data retrieval")
+            _LOGGER.exception("Unexpected error during data retrieval")
             return None

@@ -1,14 +1,13 @@
 {
-    "domain": "saskpower_smartmeter",
-    "name": "SaskPower SmartMeter",
-    "config_flow": true,
-    "documentation": "https://github.com/home-assistant/example-custom-config/tree/master/custom_components/example_sensor",
-    "issue_tracker": "https://github.com/home-assistant/example-custom-config/issues",
-    "requirements": [
-      "requests"
-    ],
-    "version": "1.0.0",
-    "codeowners": [],
-    "iot_class": "cloud_polling"
-  }
-  
+  "domain": "saskpower_smartmeter",
+  "name": "SaskPower SmartMeter",
+  "config_flow": true,
+  "documentation": "https://github.com/home-assistant/example-custom-config/tree/master/custom_components/example_sensor",
+  "issue_tracker": "https://github.com/home-assistant/example-custom-config/issues",
+  "requirements": [
+    "requests"
+  ],
+  "version": "1.1.0",
+  "codeowners": [],
+  "iot_class": "cloud_polling"
+}
