@@ -105,11 +105,16 @@ class SaskPowerOptionsFlow(config_entries.OptionsFlow):
             return self.async_create_entry(title="", data=user_input)
 
         # Pre-fill with current values so the user can see what's set.
-        current_backfill = self._config_entry.data.get(
-            "backfill_days", _BACKFILL_DAYS_DEFAULT
+        # Check entry.options first — that's where previously saved option
+        # changes live. Fall back to entry.data (original setup values) if
+        # the user has never visited the options form before (#9).
+        current_backfill = self._config_entry.options.get(
+            "backfill_days",
+            self._config_entry.data.get("backfill_days", _BACKFILL_DAYS_DEFAULT),
         )
-        current_interval = self._config_entry.data.get(
-            "update_interval_hours", _UPDATE_INTERVAL_DEFAULT
+        current_interval = self._config_entry.options.get(
+            "update_interval_hours",
+            self._config_entry.data.get("update_interval_hours", _UPDATE_INTERVAL_DEFAULT),
         )
 
         return self.async_show_form(

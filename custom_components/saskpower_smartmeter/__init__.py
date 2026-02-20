@@ -73,7 +73,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_config_entry_first_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # Fix #10: register a listener so that when the user changes options via
+    # Settings → Integrations → Configure, the integration reloads automatically
+    # and picks up the new update_interval_hours / backfill_days values.
+    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+
     return True
+
+
+async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the integration when options are updated."""
+    _LOGGER.info("SaskPower options changed — reloading integration.")
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

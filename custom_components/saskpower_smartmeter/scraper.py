@@ -19,6 +19,8 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,9 +47,12 @@ def _parse_form_inputs(html: str) -> dict[str, str]:
     Standard regex approaches break when HTML attribute order varies (which is
     valid). This function parses each input tag independently so attribute
     order doesn't matter.
+
+    Handles both regular (<input ...>) and self-closing (<input ... />) tags.
     """
     inputs: dict[str, str] = {}
-    for input_tag in re.finditer(r"<input([^>]*)>", html, re.IGNORECASE):
+    # The pattern r"<input([^>]*?)/?>" handles both <input ...> and <input ... />
+    for input_tag in re.finditer(r"<input([^>]*?)/?>\s*", html, re.IGNORECASE):
         attrs = input_tag.group(1)
         name_match = re.search(r'name=["\']([^"\']+)["\']', attrs)
         value_match = re.search(r'value=["\']([^"\']*)["\']', attrs)
@@ -62,8 +67,10 @@ def _get_verification_token(html: str) -> str | None:
 
     Uses a per-tag approach so the attribute order (name vs value vs type)
     doesn't matter.
+
+    Handles both regular (<input ...>) and self-closing (<input ... />) tags.
     """
-    for input_tag in re.finditer(r"<input([^>]*)>", html, re.IGNORECASE):
+    for input_tag in re.finditer(r"<input([^>]*?)/?>\s*", html, re.IGNORECASE):
         attrs = input_tag.group(1)
         name_match = re.search(r'name=["\']([^"\']+)["\']', attrs)
         if name_match and name_match.group(1) == "__RequestVerificationToken":
@@ -71,6 +78,41 @@ def _get_verification_token(html: str) -> str | None:
             if value_match:
                 return value_match.group(1)
     return None
+
+
+def _find_token_exchange_form(html: str) -> tuple[str | None, dict[str, str] | None]:
+    """
+    Find the specific <form> on the B2C confirmation page that contains the
+    id_token field and return its action URL and all input field values.
+
+    The confirmation page may contain multiple forms (e.g. analytics, CSRF
+    helpers). Scanning for the *first* form is fragile — instead we iterate
+    every form block and return the one that actually holds id_token.
+
+    Returns:
+        (action_url, form_fields) if the correct form is found, else (None, None).
+    """
+    # Match each complete <form>...</form> block, including its opening tag attrs.
+    for form_match in re.finditer(
+        r"(<form[^>]*>)(.*?)</form>", html, re.IGNORECASE | re.DOTALL
+    ):
+        form_open_tag = form_match.group(1)
+        form_body = form_match.group(2)
+
+        # Only consider this form if it contains an id_token hidden input.
+        if not re.search(r'name=["\']id_token["\']', form_body, re.IGNORECASE):
+            continue
+
+        # Extract the action URL from the opening <form> tag.
+        action_match = re.search(r'action=["\']([^"\']+)["\']', form_open_tag, re.IGNORECASE)
+        if not action_match:
+            continue
+
+        action_url = action_match.group(1).replace("&amp;", "&")
+        form_fields = _parse_form_inputs(form_body)
+        return action_url, form_fields
+
+    return None, None
 
 
 class SaskPowerScraper:
@@ -99,9 +141,27 @@ class SaskPowerScraper:
         self._password = password
         self._account_number = account_number
         self._session = session or requests.Session()
+
+        # Retry strategy for transient network failures (#3c).
+        # Retries up to 3 times on connection errors and 5xx server errors,
+        # with exponential backoff (0s, 2s, 4s). This prevents a single
+        # SaskPower server hiccup at the one daily poll window from causing
+        # a missed data update. Only idempotent methods (GET, POST here) are
+        # retried, and only on responses that are safe to retry.
+        _retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,          # waits 0s, 2s, 4s between retries
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False,     # let our own raise_for_status() handle it
+        )
+        _adapter = HTTPAdapter(max_retries=_retry_strategy)
+        self._session.mount("https://", _adapter)
+        self._session.mount("http://", _adapter)
+
         self._session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -125,15 +185,23 @@ class SaskPowerScraper:
 
             # --- Step 1: POST to SaskPower to trigger the B2C redirect ---
             _LOGGER.debug("Step 1: Initiating login to get Azure B2C redirect.")
-            return_url = (
+            # Build the inner ReturnUrl as a plain string, then encode it exactly
+            # once as a query parameter. The previous version pre-encoded parts of
+            # the URL manually AND then called quote() again, producing double-encoding
+            # (%3a → %253a) which caused Sitecore to reject the request.
+            inner_return_url = (
+                f"http://www.saskpower.com{_DASHBOARD_PATH}"
+            )
+            callback_url = (
                 f"{_BASE_URL}{_CALLBACK_PATH}"
-                f"?ReturnUrl=http%3a%2f%2f{_BASE_URL.replace('https://', '')}{_DASHBOARD_PATH}"
-                f"&sc_site=SaskPower&authenticationSource=Default"
+                f"?ReturnUrl={requests.utils.quote(inner_return_url, safe='')}"
+                f"&sc_site=SaskPower"
+                f"&authenticationSource=Default"
             )
             initial_url = (
                 f"{_BASE_URL}{_LOGIN_PATH}"
                 f"?authenticationType=SaskPower.Azure.B2C"
-                f"&ReturnUrl={requests.utils.quote(return_url, safe='')}"
+                f"&ReturnUrl={requests.utils.quote(callback_url, safe='')}"
                 f"&sc_site=SaskPower"
             )
             response = self._session.post(initial_url, allow_redirects=True, timeout=30)
@@ -227,29 +295,20 @@ class SaskPowerScraper:
             confirmed_response.raise_for_status()
 
             # --- Step 5: Parse and submit the final token-exchange form ---
-            _LOGGER.debug("Step 5: Submitting final token exchange form back to SaskPower.")
-            form_action_match = re.search(
-                r"<form[^>]+action=['\"]([^'\"]+)['\"]", confirmed_response.text
-            )
-            if not form_action_match:
+            # The B2C confirmation page may contain multiple <form> elements
+            # (e.g. analytics or hidden CSRF forms). We must find the specific
+            # form that contains the id_token field, not just the first form.
+            _LOGGER.debug("Step 5: Locating token-exchange form in B2C confirmation page.")
+            form_action, form_data = _find_token_exchange_form(confirmed_response.text)
+
+            if form_action is None or form_data is None:
                 _LOGGER.error(
-                    "Step 5 failed: could not find form action in B2C confirmation page. "
-                    "The B2C flow may have changed."
+                    "Step 5 failed: could not find a form containing 'id_token' "
+                    "in the B2C confirmation page. The B2C flow may have changed."
                 )
                 return False
 
-            form_action = form_action_match.group(1).replace("&amp;", "&")
-
-            # Use the robust per-tag parser so attribute order doesn't matter.
-            form_data = _parse_form_inputs(confirmed_response.text)
-
-            if not form_data.get("id_token"):
-                _LOGGER.error(
-                    "Step 5 failed: 'id_token' not found in the final form. "
-                    "Available fields: %s",
-                    list(form_data.keys()),
-                )
-                return False
+            _LOGGER.debug("Step 5: Submitting token-exchange form to %s", form_action)
 
             final_response = self._session.post(
                 form_action, data=form_data, allow_redirects=True, timeout=30
@@ -311,7 +370,11 @@ class SaskPowerScraper:
             "accountNumbers[]": self._account_number,
             "collectiveAccountNumbers[]": "",
             "bpNumbers[]": "undefined",
-            "meterTypes[]": "7",
+            # meterTypes[] is intentionally omitted. The original value of "7"
+            # is the identifier for a standard residential smart meter but is
+            # wrong for solar/bi-directional, commercial, and legacy accounts.
+            # Omitting the filter lets the API return data for all meters on
+            # the account, which is safer and more portable (#2a).
             "isChildSelected[]": "false",
             "fromDate": start_date.strftime("%Y%m%d"),
             "toDate": end_date.strftime("%Y%m%d"),
@@ -338,7 +401,16 @@ class SaskPowerScraper:
             if json_data.get("NoDataAvailable"):
                 _LOGGER.warning("No data available for category '%s'.", data_category)
                 return None
-            zip_bytes = base64.b64decode(json_data.get("FileData", ""))
+            # Fix #8: base64.b64decode raises binascii.Error on malformed input.
+            try:
+                zip_bytes = base64.b64decode(json_data.get("FileData", ""))
+            except Exception:
+                _LOGGER.error(
+                    "Failed to base64-decode FileData for '%s'. "
+                    "The API response format may have changed.",
+                    data_category,
+                )
+                return None
         elif "application/zip" in content_type:
             zip_bytes = api_response.content
         else:
@@ -351,14 +423,35 @@ class SaskPowerScraper:
             _LOGGER.warning("API returned empty file data for '%s'.", data_category)
             return None
 
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            csv_filename = next((f for f in zf.namelist() if f.endswith(".csv")), None)
-            if not csv_filename:
-                _LOGGER.error("No CSV file found in ZIP for '%s'.", data_category)
-                return None
-            with zf.open(csv_filename) as csv_file:
-                csv_text = io.TextIOWrapper(csv_file, "utf-8-sig")
-                return list(csv.DictReader(csv_text))
+        # Fix #7: zipfile.BadZipFile is raised when the server returns a non-ZIP
+        # body (e.g. an HTML error page) with a 200 status. It is not a subclass
+        # of requests.exceptions.RequestException so must be caught explicitly.
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                csv_filename = next((f for f in zf.namelist() if f.endswith(".csv")), None)
+                if not csv_filename:
+                    _LOGGER.error("No CSV file found in ZIP for '%s'.", data_category)
+                    return None
+                with zf.open(csv_filename) as csv_file:
+                    csv_text = io.TextIOWrapper(csv_file, "utf-8-sig")
+                    rows = list(csv.DictReader(csv_text))
+                    # Log the actual column names at DEBUG level every fetch.
+                    # If SaskPower renames a column, this makes the new names
+                    # immediately visible in the log without needing to dig into
+                    # raw responses (#2c).
+                    if rows:
+                        _LOGGER.debug(
+                            "'%s' CSV columns: %s", data_category, list(rows[0].keys())
+                        )
+                    return rows
+        except zipfile.BadZipFile:
+            _LOGGER.error(
+                "Server returned an invalid ZIP for '%s'. "
+                "The response may be an HTML error page. First 200 bytes: %s",
+                data_category,
+                zip_bytes[:200],
+            )
+            return None
 
     @staticmethod
     def _parse_saskpower_datetime(raw: str) -> datetime:
@@ -420,9 +513,14 @@ class SaskPowerScraper:
             start_date = end_date - timedelta(days=fetch_days)
 
             # --- 1. Power Usage Data (PD) ---
-            usage_data = self._fetch_data_from_api(
-                verification_token, "PD", start_date, end_date
-            )
+            # Guarded independently so a BB failure won't suppress PD data and vice versa.
+            try:
+                usage_data = self._fetch_data_from_api(
+                    verification_token, "PD", start_date, end_date
+                )
+            except Exception as exc:
+                _LOGGER.error("Failed to fetch power usage (PD) data: %s", exc)
+                usage_data = None
             usage_stats: dict = {}
             interval_readings: list[dict] = []
 
@@ -446,15 +544,31 @@ class SaskPowerScraper:
 
                 interval_readings.sort(key=lambda x: x["datetime"])
 
-                # A "full day" has 96 x 15-minute readings.
+                # A full day has 96 x 15-minute readings. However, smart meters
+                # frequently drop individual packets over wireless links, so
+                # requiring exactly 96 means a single missed reading causes the
+                # whole day to be skipped and the integration rolls back to the
+                # previous day silently. A threshold of 80 readings (83% of a
+                # day, or ~20 hours of data) is a pragmatic tolerance that
+                # catches genuinely incomplete days (e.g. meter offline for
+                # hours) while accepting normal packet loss (#2b).
+                _FULL_DAY_THRESHOLD = 80
                 most_recent_full_day = next(
                     (
                         d
                         for d in sorted(data_by_day.keys(), reverse=True)
-                        if len(data_by_day[d]) >= 96
+                        if len(data_by_day[d]) >= _FULL_DAY_THRESHOLD
                     ),
                     None,
                 )
+
+                if most_recent_full_day and len(data_by_day[most_recent_full_day]) < 96:
+                    _LOGGER.warning(
+                        "Most recent usable day (%s) has only %d/96 readings. "
+                        "Some intervals may have been missed by the meter.",
+                        most_recent_full_day,
+                        len(data_by_day[most_recent_full_day]),
+                    )
 
                 daily_usage = (
                     sum(data_by_day[most_recent_full_day]) if most_recent_full_day else 0
@@ -496,9 +610,16 @@ class SaskPowerScraper:
 
             # --- 2. Billing Data (BB) ---
             # Billing files are small so always fetch the full history.
-            billing_data = self._fetch_data_from_api(
-                verification_token, "BB", date(2000, 1, 1), date.today()
-            )
+            # Uses the already-computed end_date (fix #14) for consistency —
+            # avoids a theoretical date mismatch if midnight falls between fetches.
+            # Guarded independently so a PD failure won't suppress billing data.
+            try:
+                billing_data = self._fetch_data_from_api(
+                    verification_token, "BB", date(2000, 1, 1), end_date
+                )
+            except Exception as exc:
+                _LOGGER.error("Failed to fetch billing (BB) data: %s", exc)
+                billing_data = None
             billing_stats: dict = {}
 
             if billing_data:
@@ -517,7 +638,7 @@ class SaskPowerScraper:
                         latest_bill = max(
                             billing_data,
                             key=lambda row: datetime.strptime(
-                                row[bill_date_key].strip(), "%d-%b-%Y"
+                                row[bill_date_key].strip().upper(), "%d-%b-%Y"
                             ),
                         )
                         last_bill_charges = float(

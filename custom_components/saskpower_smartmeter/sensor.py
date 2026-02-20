@@ -218,8 +218,12 @@ class StatisticsSensor(SaskPowerBaseSensor):
         config: dict,
     ) -> None:
         super().__init__(coordinator, entry)
-        # Start at 0 so the sensor is immediately visible in the UI.
-        self._attr_native_value = 0
+        # Leave native_value as None until the first statistics import completes.
+        # Setting it to 0 here would make the sensor appear available with a
+        # misleading zero reading before any real data has been imported (#12).
+        # Subclasses define _attr_native_unit_of_measurement before this base
+        # __init__ runs (as class-level attributes), so there is no window where
+        # a value exists without a unit (#13).
         self._backfill_days: int = config.get("backfill_days", 30)
 
     async def async_added_to_hass(self) -> None:
@@ -301,8 +305,10 @@ class SaskPowerTotalConsumptionSensor(StatisticsSensor):
         )
 
         # Query the recorder for the most recent existing statistic.
+        # NOTE: The convert_units parameter was removed in HA 2024.2. The correct
+        # signature is now (hass, number_of_stats, statistic_id, types).
         last_stats = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
+            get_last_statistics, self.hass, 1, statistic_id, {"sum"}
         )
 
         last_stat_row = last_stats.get(statistic_id, [{}])
@@ -312,10 +318,13 @@ class SaskPowerTotalConsumptionSensor(StatisticsSensor):
         if last_stat_row and last_stat_row[0]:
             last_sum = last_stat_row[0].get("sum", 0) or 0
             last_start_ts = last_stat_row[0].get("start", 0) or 0
-            filter_time = datetime.fromtimestamp(last_start_ts, tz=timezone.utc)
+            # Advance by one full hour: the last recorded stat covers the hour
+            # starting at last_start_ts, so we only want readings from the NEXT
+            # hour onwards. Using > last_start_ts would re-process the boundary hour.
+            filter_time = datetime.fromtimestamp(last_start_ts, tz=timezone.utc) + timedelta(hours=1)
             starting_sum = last_sum
             _LOGGER.debug(
-                "Existing consumption stats found: last_sum=%.3f, last_time=%s",
+                "Existing consumption stats found: last_sum=%.3f, next_import_from=%s",
                 last_sum,
                 filter_time,
             )
@@ -442,8 +451,10 @@ class SaskPowerTotalCostSensor(StatisticsSensor):
             avg_cost,
         )
 
+        # NOTE: The convert_units parameter was removed in HA 2024.2. The correct
+        # signature is now (hass, number_of_stats, statistic_id, types).
         last_stats = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
+            get_last_statistics, self.hass, 1, statistic_id, {"sum"}
         )
 
         last_stat_row = last_stats.get(statistic_id, [{}])
@@ -452,10 +463,12 @@ class SaskPowerTotalCostSensor(StatisticsSensor):
         if last_stat_row and last_stat_row[0]:
             last_sum = last_stat_row[0].get("sum", 0) or 0
             last_start_ts = last_stat_row[0].get("start", 0) or 0
-            filter_time = datetime.fromtimestamp(last_start_ts, tz=timezone.utc)
+            # Advance by one full hour so the already-recorded boundary hour
+            # is not re-imported on every update cycle.
+            filter_time = datetime.fromtimestamp(last_start_ts, tz=timezone.utc) + timedelta(hours=1)
             starting_sum = last_sum
             _LOGGER.debug(
-                "Existing cost stats found: last_sum=%.2f, last_time=%s",
+                "Existing cost stats found: last_sum=%.2f, next_import_from=%s",
                 last_sum,
                 filter_time,
             )
