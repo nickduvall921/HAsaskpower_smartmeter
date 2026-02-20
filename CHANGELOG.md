@@ -1,5 +1,54 @@
 # Changelog
 
+All notable changes to the SaskPower SmartMeter integration are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [1.1.2] - 2026-02-19
+
+### Fixed
+
+#### Login & Authentication (`scraper.py`)
+- **Azure B2C policy name extraction broke with new URL format**: Microsoft
+  changed the Azure B2C authorize URL structure. The policy name was previously
+  found in the `?p=` query parameter, but is now embedded in the URL path
+  (e.g. `.../b2c_1a_accountlink_signuporsignin/oauth2/v2.0/authorize`). The
+  integration was failing at Step 2 of login with the error *"could not extract
+  B2C policy name"* for all users. Policy extraction now tries the query
+  parameter first for backwards compatibility, then falls back to reading the
+  path segment immediately after the tenant name that starts with `b2c_`.
+
+#### Data Retrieval (`scraper.py`)
+- **`meterTypes[]` removal caused 500 Server Error**: Version 1.1.1 removed the
+  `meterTypes[]: "7"` field from the API payload to improve portability for
+  non-standard meters. In practice the SaskPower `DownloadData` endpoint
+  requires the field to be present and returns a 500 Internal Server Error when
+  it is absent, breaking data retrieval for all users. The field has been
+  restored. Non-standard meter users who receive no data are asked to open an
+  issue so the correct value for their meter type can be identified and made
+  configurable.
+- **500 Server Error response body now logged before raising**: Previously a
+  server error only surfaced the HTTP status code in the logs with no indication
+  of the underlying cause. The first 500 characters of the response body are now
+  logged at ERROR level before the exception is raised, making future server-
+  side failures much easier to diagnose.
+
+#### Home Assistant Statistics (`sensor.py`)
+- **`get_last_statistics` signature incorrectly changed in 1.1.1**: A prior
+  change removed the `convert_units` positional argument from the
+  `get_last_statistics` call based on incorrect information that it had been
+  removed in HA 2024.2. This caused a `TypeError: missing 1 required positional
+  argument: 'types'` on startup, preventing both the `SaskPower Total
+  Consumption` and `SaskPower Estimated Total Cost` sensors from loading. The
+  confirmed current signature is
+  `(hass, number_of_stats, statistic_id, convert_units, types)` and
+  `convert_units=True` has been restored to both call sites.
+
+---
+
 ## [1.1.1] - 2026-02-19
 
 ### Fixed
@@ -125,7 +174,7 @@
 
 - **User-Agent updated** from Chrome/124 to Chrome/131 to reflect a more
   current browser version.
-- Version bumped from `1.0.0` → `1.1.0` → `1.1.1`.
+- Version bumped from `1.0.0` → `1.1.0` → `1.1.1` → `1.1.2`.
 
 ---
 

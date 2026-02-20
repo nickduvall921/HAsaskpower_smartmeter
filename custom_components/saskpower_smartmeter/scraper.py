@@ -239,14 +239,37 @@ class SaskPowerScraper:
             csrf_token = csrf_match.group(1)
             trans_id = transid_match.group(1)
 
-            # Extract the B2C policy name from the URL query string.
-            # This is critical — if it can't be found we must fail loudly rather
-            # than silently falling back to a hardcoded value that may be wrong.
-            policy = parse_qs(urlparse(response.url).query).get("p", [None])[0]
+            # Extract the B2C policy name. Microsoft has used two URL formats:
+            #
+            # Old format — policy in query string:
+            #   /oauth2/v2.0/authorize?p=b2c_1a_accountlink_signuporsignin&...
+            #
+            # New format — policy in URL path (observed 2025+):
+            #   /saskpowerb2c.onmicrosoft.com/b2c_1a_accountlink_signuporsignin/oauth2/...
+            #
+            # Try the query param first, then fall back to the path segment
+            # that follows the tenant name in the URL.
+            parsed_url = urlparse(response.url)
+            policy = parse_qs(parsed_url.query).get("p", [None])[0]
+
+            if not policy:
+                # Path-based extraction: the policy is the segment immediately
+                # after the onmicrosoft.com tenant component in the URL path.
+                # e.g. /saskpowerb2c.onmicrosoft.com/b2c_1a_.../oauth2/...
+                path_segments = [s for s in parsed_url.path.split("/") if s]
+                for i, segment in enumerate(path_segments):
+                    if "onmicrosoft.com" in segment and i + 1 < len(path_segments):
+                        candidate = path_segments[i + 1]
+                        # B2C policy names always start with 'b2c_'
+                        if candidate.lower().startswith("b2c_"):
+                            policy = candidate
+                            break
+
             if not policy:
                 _LOGGER.error(
                     "Step 2 failed: could not extract B2C policy name from URL '%s'. "
-                    "The login URL structure may have changed.",
+                    "Tried both '?p=' query parameter and path-based extraction. "
+                    "The Azure B2C URL structure may have changed.",
                     response.url,
                 )
                 return False
@@ -370,11 +393,14 @@ class SaskPowerScraper:
             "accountNumbers[]": self._account_number,
             "collectiveAccountNumbers[]": "",
             "bpNumbers[]": "undefined",
-            # meterTypes[] is intentionally omitted. The original value of "7"
-            # is the identifier for a standard residential smart meter but is
-            # wrong for solar/bi-directional, commercial, and legacy accounts.
-            # Omitting the filter lets the API return data for all meters on
-            # the account, which is safer and more portable (#2a).
+            # meterTypes[] "7" = standard residential smart meter.
+            # We originally omitted this field hoping the API would return all
+            # meter types, but the SaskPower server returns a 500 when it is
+            # absent. Restored to "7" as the required default. Users with
+            # non-standard meters (solar, commercial) who receive no data should
+            # file an issue so the correct value can be determined for their
+            # meter type and made configurable.
+            "meterTypes[]": "7",
             "isChildSelected[]": "false",
             "fromDate": start_date.strftime("%Y%m%d"),
             "toDate": end_date.strftime("%Y%m%d"),
@@ -393,6 +419,16 @@ class SaskPowerScraper:
         api_response = self._session.post(
             api_url, headers=api_headers, data=payload, timeout=60
         )
+        # Log the response body on server errors before raising, so we can
+        # diagnose exactly what the server objected to.
+        if api_response.status_code >= 500:
+            _LOGGER.error(
+                "DownloadData API returned %d for category '%s'. "
+                "Response body (first 500 chars): %s",
+                api_response.status_code,
+                data_category,
+                api_response.text[:500],
+            )
         api_response.raise_for_status()
 
         content_type = api_response.headers.get("Content-Type", "")

@@ -305,10 +305,12 @@ class SaskPowerTotalConsumptionSensor(StatisticsSensor):
         )
 
         # Query the recorder for the most recent existing statistic.
-        # NOTE: The convert_units parameter was removed in HA 2024.2. The correct
-        # signature is now (hass, number_of_stats, statistic_id, types).
+        # Signature: get_last_statistics(hass, number_of_stats, statistic_id,
+        #   convert_units, types). convert_units=True normalises units to the
+        # display unit (e.g. Wh → kWh). Despite earlier speculation it was
+        # removed, the 5-argument signature is confirmed present in current HA.
         last_stats = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, {"sum"}
+            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
         )
 
         last_stat_row = last_stats.get(statistic_id, [{}])
@@ -451,10 +453,12 @@ class SaskPowerTotalCostSensor(StatisticsSensor):
             avg_cost,
         )
 
-        # NOTE: The convert_units parameter was removed in HA 2024.2. The correct
-        # signature is now (hass, number_of_stats, statistic_id, types).
+        # Signature: get_last_statistics(hass, number_of_stats, statistic_id,
+        #   convert_units, types). convert_units=True normalises units to the
+        # display unit (e.g. Wh → kWh). Despite earlier speculation it was
+        # removed, the 5-argument signature is confirmed present in current HA.
         last_stats = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, {"sum"}
+            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
         )
 
         last_stat_row = last_stats.get(statistic_id, [{}])
